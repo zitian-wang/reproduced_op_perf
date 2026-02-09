@@ -37,8 +37,8 @@ profiler0 = torch.profiler.profile(
         torch.profiler.ProfilerActivity.CUDA,
     ],
     schedule=torch.profiler.schedule(
-        wait=0,
-        warmup=5,
+        wait=5,
+        warmup=0,
         active=10,
         repeat=1
     ),
