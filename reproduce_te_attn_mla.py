@@ -12,7 +12,7 @@ layer_number=1
 deterministic=False
 attn_kwargs = {'attention_dropout': 0.0,
               'attention_dropout_ctx': nullcontext}
-seqlen = 1024*256
+seqlen = 1024*32
 device = torch.device("cuda")
 query_layer = torch.randn((seqlen,16,192), dtype = torch.bfloat16, device = device, requires_grad = True)
 key_layer = torch.randn((seqlen,16,192), dtype = torch.bfloat16, device = device, requires_grad = True)
