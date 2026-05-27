@@ -1,7 +1,15 @@
+import os
+
 import torch
-from torch.profiler import profile, record_function, ProfilerActivity
+import torch.nn.functional as F
+from torch.profiler import ProfilerActivity, profile, record_function
 from flash_attn import flash_attn_varlen_func
-from aiter import flash_attn_varlen_func as flash_attn_varlen_func_aiter
+
+# Make the Transformer Engine comparison use TE/cuDNN fused attention, not its
+# flash-attn dispatch path, so it is a real replacement for the missing aiter.
+os.environ["NVTE_FLASH_ATTN"] = "0"
+os.environ["NVTE_FUSED_ATTN"] = "1"
+os.environ["NVTE_UNFUSED_ATTN"] = "0"
 
 device = torch.device("cuda:0")
 q = torch.randn((68496, 16, 72), dtype = torch.bfloat16, device = device, requires_grad = True)
@@ -17,70 +25,113 @@ cu_k = torch.tensor([0,  3928,  6111,  9866, 11515, 14854, 17020, 19084, 22679, 
 causal = True
 softmax_scale = 0.08838834764831845
 
+
+def make_te_attention():
+    from transformer_engine.pytorch import DotProductAttention
+
+    return DotProductAttention(
+        num_attention_heads=q.shape[1],
+        kv_channels=q.shape[2],
+        attention_dropout=0.0,
+        qkv_format="thd",
+        attn_mask_type="padding_causal",
+        softmax_scale=softmax_scale,
+    ).to(device)
+
+
+te_attention = make_te_attention()
+te_attention.train()
+
+
+def clear_grads():
+    q.grad = None
+    k.grad = None
+    v.grad = None
+
+
+def run_flash_attn():
+    return flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=4096,
+        max_seqlen_k=4096,
+        softmax_scale=softmax_scale,
+        causal=causal,
+    )
+
+
+def run_transformer_engine():
+    out = te_attention(
+        q,
+        k,
+        v,
+        qkv_format="thd",
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_k,
+        max_seqlen_q=4096,
+        max_seqlen_kv=4096,
+        attn_mask_type="padding_causal",
+    )
+    if out.ndim == 2:
+        out = out.view_as(q)
+    return out
+
+
+def run_sdpa():
+    outputs = []
+    for i in range(cu_q.numel() - 1):
+        q_start, q_end = cu_q[i].item(), cu_q[i + 1].item()
+        k_start, k_end = cu_k[i].item(), cu_k[i + 1].item()
+        q_i = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
+        k_i = k[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        v_i = v[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        out_i = F.scaled_dot_product_attention(
+            q_i,
+            k_i,
+            v_i,
+            dropout_p=0.0,
+            is_causal=causal,
+            scale=softmax_scale,
+        )
+        outputs.append(out_i.squeeze(0).transpose(0, 1))
+    return torch.cat(outputs, dim=0)
+
+
+def run_profile(label, fn):
+    clear_grads()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True) as prof:
+        with record_function(label):
+            out = fn()
+            out.sum().backward()
+            q_grad = q.grad.clone()
+    clear_grads()
+    print(f"\n{label}")
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    return out, q_grad
+
+
 for i in range(5): #warmup
-    out = flash_attn_varlen_func(q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=4096, max_seqlen_k=4096, softmax_scale=softmax_scale, causal=True)
-    out.sum().backward()
-    q.grad = None
-
-    out2, _ = flash_attn_varlen_func_aiter(q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=4096, max_seqlen_k=4096, softmax_scale=softmax_scale, causal=True, return_lse=True)
-    out2.sum().backward()
-    q.grad = None
+    for fn in (run_flash_attn, run_transformer_engine, run_sdpa):
+        out = fn()
+        out.sum().backward()
+        clear_grads()
 
 
-with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True) as prof:
-    out = flash_attn_varlen_func(q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=4096, max_seqlen_k=4096, softmax_scale=softmax_scale, causal=True)
-    out.sum().backward()
-    q_grad = q.grad.clone()
-    q.grad = None
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+out_flash, q_grad_flash = run_profile("flash-attn", run_flash_attn)
+out_te, q_grad_te = run_profile("transformer-engine", run_transformer_engine)
+out_sdpa, q_grad_sdpa = run_profile("pytorch-sdpa", run_sdpa)
 
-with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True) as prof:
-    out2, _ = flash_attn_varlen_func_aiter(q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=4096, max_seqlen_k=4096, softmax_scale=softmax_scale, causal=True, return_lse=True)
-    out2.sum().backward()
-    q_grad2 = q.grad.clone()
-    q.grad = None
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
-print('q_grad/q_grad2 is nan: ', q_grad.isnan().any(),q_grad2.isnan().any())
-print('diff output, mean/max: ', (out2-out).abs().mean().item(),(out2-out).abs().max().item())
-print('diff grad,  mean/max: ', (q_grad2-q_grad).abs().mean().item(),(q_grad2-q_grad).abs().max().item())
+def print_diff(label, actual, expected):
+    diff = (actual.detach() - expected.detach()).abs()
+    print(f'{label}, mean/max: ', diff.mean().item(), diff.max().item())
 
-'''
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
-                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
-autograd::engine::evaluate_function: FlashAttnVarlen...         0.00%      15.141us         0.09%     576.444us     576.444us       0.000us         0.00%     110.681ms     110.681ms             1
-                            FlashAttnVarlenFuncBackward         0.02%     142.468us         0.09%     561.303us     561.303us       0.000us         0.00%     110.681ms     110.681ms             1
-                flash_attn::_flash_attn_varlen_backward         0.04%     267.994us         0.06%     384.262us     384.262us     110.451ms        89.44%     110.681ms     110.681ms             1
-void ck_tile::kentry<256, 1, ck_tile::FmhaBwdDQDKDVK...         0.00%       0.000us         0.00%       0.000us       0.000us     106.862ms        86.53%     106.862ms     106.862ms             1
-                                    FlashAttnVarlenFunc         0.02%     109.943us         0.06%     381.231us     381.231us       0.000us         0.00%      12.296ms      12.296ms             1
-                 flash_attn::_flash_attn_varlen_forward         0.03%     168.633us         0.04%     259.962us     259.962us      12.296ms         9.96%      12.296ms      12.296ms             1
-void ck_tile::kentry<256, 2, ck_tile::FmhaFwdKernel<...         0.00%       0.000us         0.00%       0.000us       0.000us      12.296ms         9.96%      12.296ms      12.296ms             1
-void ck_tile::kentry<64, 2, ck_tile::FmhaBwdOGradDot...         0.00%       0.000us         0.00%       0.000us       0.000us       3.055ms         2.47%       3.055ms       3.055ms             1
-void ck_tile::kentry<256, 2, ck_tile::FmhaBwdConvert...         0.00%       0.000us         0.00%       0.000us       0.000us     533.723us         0.43%     533.723us     533.723us             1
-autograd::engine::evaluate_function: torch::autograd...         0.00%      11.902us         0.01%      65.223us      21.741us       0.000us         0.00%     282.519us      94.173us             3
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
-Self CPU time total: 646.944ms
-Self CUDA time total: 123.493ms
 
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
-                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
-autograd::engine::evaluate_function: FlashAttnVarlen...         0.07%      23.571us         2.90%     959.529us     959.529us       0.000us         0.00%      24.535ms      24.535ms             1
-                            FlashAttnVarlenFuncBackward         1.06%     349.383us         2.83%     935.958us     935.958us       0.000us         0.00%      24.535ms      24.535ms             1
-                      aiter::wrapper_fmha_v3_varlen_bwd         0.38%     126.054us         1.29%     427.629us     427.629us      24.296ms        73.07%      24.414ms      24.414ms             1
-aiter::fmha_bwd_hd128_bf16_causal_br_a32_rtna_psskdd...         0.00%       0.000us         0.00%       0.000us       0.000us      20.775ms        62.48%      20.775ms      20.775ms             1
-                                    FlashAttnVarlenFunc         0.40%     132.688us         0.92%     304.869us     304.869us       0.000us         0.00%       8.199ms       8.199ms             1
-                          aiter::wrapper_mha_varlen_fwd         0.29%      97.605us         0.49%     160.639us     160.639us       8.199ms        24.66%       8.199ms       8.199ms             1
-_ZN7ck_tile6kentryILi2ENS_13FmhaFwdKernelINS_28Block...         0.00%       0.000us         0.00%       0.000us       0.000us       8.199ms        24.66%       8.199ms       8.199ms             1
-_ZN7ck_tile6kentryILi2ENS_22FmhaBwdOGradDotOKernelIN...         0.00%       0.000us         0.00%       0.000us       0.000us       3.031ms         9.12%       3.031ms       3.031ms             1
-_ZN7ck_tile6kentryILi2ENS_25FmhaBwdConvertQGradKerne...         0.00%       0.000us         0.00%       0.000us       0.000us     489.842us         1.47%     489.842us     489.842us             1
-autograd::engine::evaluate_function: torch::autograd...         0.06%      20.631us         0.28%      94.282us      31.427us       0.000us         0.00%     279.919us      93.306us             3
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
-Self CPU time total: 33.094ms
-Self CUDA time total: 33.249ms
-
-q_grad/q_grad2 is nan:  tensor(False, device='cuda:0') tensor(False, device='cuda:0')
-diff output, mean/max:  0.0002193450927734375 0.03125
-diff grad,  mean/max:  8.20159912109375e-05 0.03125
-'''
+print('q_grad flash/te/sdpa is nan: ', q_grad_flash.isnan().any(), q_grad_te.isnan().any(), q_grad_sdpa.isnan().any())
+print_diff('diff output flash/te', out_te, out_flash)
+print_diff('diff grad flash/te ', q_grad_te, q_grad_flash)
+print_diff('diff output flash/sdpa', out_sdpa, out_flash)
+print_diff('diff grad flash/sdpa ', q_grad_sdpa, q_grad_flash)
