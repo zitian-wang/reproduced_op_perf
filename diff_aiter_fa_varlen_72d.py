@@ -5,12 +5,6 @@ import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile, record_function
 from flash_attn import flash_attn_varlen_func
 
-# Make the Transformer Engine comparison use TE/cuDNN fused attention, not its
-# flash-attn dispatch path, so it is a real replacement for the missing aiter.
-os.environ["NVTE_FLASH_ATTN"] = "0"
-os.environ["NVTE_FUSED_ATTN"] = "1"
-os.environ["NVTE_UNFUSED_ATTN"] = "0"
-
 device = torch.device("cuda:0")
 q = torch.randn((68496, 16, 72), dtype = torch.bfloat16, device = device, requires_grad = True)
 k = torch.randn((68496, 16, 72), dtype = torch.bfloat16, device = device, requires_grad = True)
@@ -25,8 +19,20 @@ cu_k = torch.tensor([0,  3928,  6111,  9866, 11515, 14854, 17020, 19084, 22679, 
 causal = True
 softmax_scale = 0.08838834764831845
 
+is_rocm = torch.version.hip is not None
+is_cuda = torch.version.cuda is not None and not is_rocm
+backend = "rocm" if is_rocm else "cuda" if is_cuda else "unknown"
+
+te_attention = None
+aiter_flash_attn_varlen_func = None
+
 
 def make_te_attention():
+    # Use TE/cuDNN fused attention, not TE's flash-attn dispatch path.
+    os.environ["NVTE_FLASH_ATTN"] = "0"
+    os.environ["NVTE_FUSED_ATTN"] = "1"
+    os.environ["NVTE_UNFUSED_ATTN"] = "0"
+
     from transformer_engine.pytorch import DotProductAttention
 
     return DotProductAttention(
@@ -39,8 +45,21 @@ def make_te_attention():
     ).to(device)
 
 
-te_attention = make_te_attention()
-te_attention.train()
+def get_te_attention():
+    global te_attention
+    if te_attention is None:
+        te_attention = make_te_attention()
+        te_attention.train()
+    return te_attention
+
+
+def get_aiter_flash_attn_varlen_func():
+    global aiter_flash_attn_varlen_func
+    if aiter_flash_attn_varlen_func is None:
+        from aiter import flash_attn_varlen_func as func
+
+        aiter_flash_attn_varlen_func = func
+    return aiter_flash_attn_varlen_func
 
 
 def clear_grads():
@@ -63,8 +82,26 @@ def run_flash_attn():
     )
 
 
+def run_aiter():
+    aiter_flash_attn = get_aiter_flash_attn_varlen_func()
+    out, _ = aiter_flash_attn(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=4096,
+        max_seqlen_k=4096,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_lse=True,
+    )
+    return out
+
+
 def run_transformer_engine():
-    out = te_attention(
+    attention = get_te_attention()
+    out = attention(
         q,
         k,
         v,
@@ -100,6 +137,27 @@ def run_sdpa():
     return torch.cat(outputs, dim=0)
 
 
+def make_implementations():
+    implementations = [("flash-attn", run_flash_attn)]
+    if is_rocm:
+        implementations.extend(
+            [
+                ("aiter", run_aiter),
+                ("pytorch-sdpa", run_sdpa),
+            ]
+        )
+    elif is_cuda:
+        implementations.extend(
+            [
+                ("transformer-engine", run_transformer_engine),
+                ("pytorch-sdpa", run_sdpa),
+            ]
+        )
+    else:
+        raise RuntimeError("This benchmark expects a CUDA or ROCm PyTorch build.")
+    return implementations
+
+
 def run_profile(label, fn):
     clear_grads()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True) as prof:
@@ -113,16 +171,20 @@ def run_profile(label, fn):
     return out, q_grad
 
 
+implementations = make_implementations()
+print(f"backend: {backend}")
+
 for i in range(5): #warmup
-    for fn in (run_flash_attn, run_transformer_engine, run_sdpa):
+    for _, fn in implementations:
         out = fn()
         out.sum().backward()
         clear_grads()
 
 
-out_flash, q_grad_flash = run_profile("flash-attn", run_flash_attn)
-out_te, q_grad_te = run_profile("transformer-engine", run_transformer_engine)
-out_sdpa, q_grad_sdpa = run_profile("pytorch-sdpa", run_sdpa)
+profiled = []
+for label, fn in implementations:
+    out, q_grad = run_profile(label, fn)
+    profiled.append((label, out, q_grad))
 
 
 def print_diff(label, actual, expected):
@@ -130,8 +192,10 @@ def print_diff(label, actual, expected):
     print(f'{label}, mean/max: ', diff.mean().item(), diff.max().item())
 
 
-print('q_grad flash/te/sdpa is nan: ', q_grad_flash.isnan().any(), q_grad_te.isnan().any(), q_grad_sdpa.isnan().any())
-print_diff('diff output flash/te', out_te, out_flash)
-print_diff('diff grad flash/te ', q_grad_te, q_grad_flash)
-print_diff('diff output flash/sdpa', out_sdpa, out_flash)
-print_diff('diff grad flash/sdpa ', q_grad_sdpa, q_grad_flash)
+reference_label, reference_out, reference_q_grad = profiled[0]
+for label, _, q_grad in profiled:
+    print(f'{label} q_grad is nan: ', q_grad.isnan().any())
+
+for label, out, q_grad in profiled[1:]:
+    print_diff(f'diff output {reference_label}/{label}', out, reference_out)
+    print_diff(f'diff grad {reference_label}/{label} ', q_grad, reference_q_grad)

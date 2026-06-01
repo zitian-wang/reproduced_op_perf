@@ -11,8 +11,8 @@ dtype = torch.bfloat16
 
 total_seqlen = 1024 * 32  # 32768
 num_heads = 16
-head_dim = 192
-softmax_scale = 0.08838834764831843
+head_dim = 256
+softmax_scale = head_dim ** -0.5
 causal = True
 
 is_rocm = torch.version.hip is not None
