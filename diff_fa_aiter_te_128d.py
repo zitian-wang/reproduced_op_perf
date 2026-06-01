@@ -12,7 +12,7 @@ dtype = torch.bfloat16
 
 total_seqlen = 1024 * 32  # 32768
 num_heads = 16
-head_dim = 192
+head_dim = 128
 softmax_scale = head_dim ** -0.5
 causal = True
 
@@ -24,8 +24,7 @@ FLYDSL_ROOT = os.environ.get("FLYDSL_ROOT", "/apps/zitwang/dev/FlyDSL")
 if FLYDSL_ROOT not in sys.path:
     sys.path.insert(0, FLYDSL_ROOT)
 
-# FlyDSL flash_attn_func cannot run head_dim=192; pad to 256 (zeros) for that case.
-FLYDSL_HEAD_DIM = 256 if head_dim == 192 else head_dim
+FLYDSL_HEAD_DIM = head_dim
 
 # Implementations that only support a forward pass (no backward / q.grad).
 FORWARD_ONLY_IMPLS = {"flydsl"}
@@ -249,8 +248,7 @@ def make_implementations():
             [
                 ("aiter", run_aiter),
                 ("transformer_engine", run_te),
-                # flydsl skipped: head_dim=192 pads to 256, whose LDS footprint
-                # overflows gfx942's 64KB limit. See diff_fa_aiter_te_128d.py.
+                ("flydsl", run_flydsl),
                 ("pytorch", run_pytorch),
             ]
         )

@@ -1,4 +1,5 @@
 import os
+import sys
 from contextlib import nullcontext
 
 import torch
@@ -19,9 +20,35 @@ is_rocm = torch.version.hip is not None
 is_cuda = torch.version.cuda is not None and not is_rocm
 backend = "rocm" if is_rocm else "cuda" if is_cuda else "unknown"
 
+FLYDSL_ROOT = os.environ.get("FLYDSL_ROOT", "/apps/zitwang/dev/FlyDSL")
+if FLYDSL_ROOT not in sys.path:
+    sys.path.insert(0, FLYDSL_ROOT)
+
+# FlyDSL flash_attn_func cannot run head_dim=192; pad to 256 (zeros) for that case.
+FLYDSL_HEAD_DIM = 256 if head_dim == 192 else head_dim
+
+# Implementations that only support a forward pass (no backward / q.grad).
+FORWARD_ONLY_IMPLS = {"flydsl"}
+
 aiter_flash_attn_varlen_func = None
 fused_attention = None
 dot_product_attention = None
+flydsl_attn = None
+
+
+def get_flydsl_attn():
+    global flydsl_attn
+    if flydsl_attn is None:
+        from kernels.flash_attn_func import build_flash_attn_func_module
+
+        flydsl_attn = build_flash_attn_func_module(
+            num_heads=num_heads,
+            head_dim=FLYDSL_HEAD_DIM,
+            causal=causal,
+            dtype_str="bf16",
+            sm_scale=softmax_scale,
+        )
+    return flydsl_attn
 
 
 def get_aiter_flash_attn_varlen_func():
@@ -171,6 +198,31 @@ def run_aiter(cu, max_seqlen):
     return out
 
 
+def run_flydsl(cu, max_seqlen):
+    exe = get_flydsl_attn()
+    cu_list = cu.tolist()
+    outs = []
+    for i in range(len(cu_list) - 1):
+        s = cu_list[i + 1] - cu_list[i]
+        q_s = q[cu_list[i]:cu_list[i + 1]].detach().contiguous()
+        k_s = k[cu_list[i]:cu_list[i + 1]].detach().contiguous()
+        v_s = v[cu_list[i]:cu_list[i + 1]].detach().contiguous()
+        d_pad = FLYDSL_HEAD_DIM - head_dim
+        s_pad = ((s + 127) // 128) * 128 - s
+        if d_pad or s_pad:
+            pads = (0, d_pad, 0, 0, 0, s_pad)  # (D_l,D_r, H_l,H_r, S_l,S_r)
+            q_s, k_s, v_s = (F.pad(t, pads) for t in (q_s, k_s, v_s))
+        s_full = s + s_pad
+        q_flat = q_s.contiguous().view(-1)
+        k_flat = k_s.contiguous().view(-1)
+        v_flat = v_s.contiguous().view(-1)
+        o_flat = torch.zeros_like(q_flat)
+        exe(q_flat, k_flat, v_flat, o_flat, 1, s_full)
+        o = o_flat.view(s_full, num_heads, FLYDSL_HEAD_DIM)[:s, :, :head_dim]
+        outs.append(o)
+    return torch.cat(outs, dim=0)
+
+
 def run_pytorch(cu, max_seqlen):
     outputs = []
     for i in range(cu.numel() - 1):
@@ -197,6 +249,8 @@ def make_implementations():
             [
                 ("aiter", run_aiter),
                 ("transformer_engine", run_te),
+                # flydsl skipped: head_dim=256 LDS footprint overflows gfx942's
+                # 64KB limit. See diff_fa_aiter_te_128d.py.
                 ("pytorch", run_pytorch),
             ]
         )
@@ -216,7 +270,7 @@ PROFILE_WARMUP_ITERS = 3
 PROFILE_ACTIVE_ITERS = 10
 
 
-def run_profile(label, fn, cu, max_seqlen, config_name):
+def run_profile(label, fn, cu, max_seqlen, config_name, supports_backward=True):
     clear_grads()
     torch.cuda.synchronize()
     out = None
@@ -224,26 +278,40 @@ def run_profile(label, fn, cu, max_seqlen, config_name):
 
     for _ in range(PROFILE_WARMUP_ITERS):
         out = fn(cu, max_seqlen)
-        out.sum().backward()
-        q_grad = q.grad.clone()
-        clear_grads()
-    torch.cuda.synchronize()
-
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True) as prof:
-        start_evt.record()
-        for _ in range(PROFILE_ACTIVE_ITERS):
-            out = fn(cu, max_seqlen)
+        if supports_backward:
             out.sum().backward()
             q_grad = q.grad.clone()
             clear_grads()
-        end_evt.record()
     torch.cuda.synchronize()
-    avg_ms = start_evt.elapsed_time(end_evt) / PROFILE_ACTIVE_ITERS
+
+    fwd_pairs = []
+    bwd_pairs = []
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True) as prof:
+        for _ in range(PROFILE_ACTIVE_ITERS):
+            fwd_start = torch.cuda.Event(enable_timing=True)
+            fwd_end = torch.cuda.Event(enable_timing=True)
+            fwd_start.record()
+            out = fn(cu, max_seqlen)
+            fwd_end.record()
+            fwd_pairs.append((fwd_start, fwd_end))
+            if supports_backward:
+                loss = out.sum()
+                bwd_start = torch.cuda.Event(enable_timing=True)
+                bwd_end = torch.cuda.Event(enable_timing=True)
+                bwd_start.record()
+                loss.backward()
+                bwd_end.record()
+                bwd_pairs.append((bwd_start, bwd_end))
+                q_grad = q.grad.clone()
+                clear_grads()
+    torch.cuda.synchronize()
+    fwd_ms = sum(s.elapsed_time(e) for s, e in fwd_pairs) / len(fwd_pairs)
     print(f"--- {label} ({config_name}) ---")
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    print(f"[{config_name}] {label} avg time/iter (fwd+bwd): {avg_ms:.3f} ms (over {PROFILE_ACTIVE_ITERS} iters)")
+    print(f"[{config_name}] {label} fwd time/iter: {fwd_ms:.3f} ms (over {PROFILE_ACTIVE_ITERS} iters)")
+    if bwd_pairs:
+        bwd_ms = sum(s.elapsed_time(e) for s, e in bwd_pairs) / len(bwd_pairs)
+        print(f"[{config_name}] {label} bwd time/iter: {bwd_ms:.3f} ms (over {PROFILE_ACTIVE_ITERS} iters)")
     return out, q_grad
 
 
@@ -254,23 +322,30 @@ for name, cu, max_seqlen in configs:
     print(f"\n========== config: {name} (max_seqlen={max_seqlen}, num_seqs={cu.numel() - 1}) ==========")
 
     for _ in range(5):  # warmup
-        for _, fn in implementations:
+        for name_w, fn in implementations:
             out = fn(cu, max_seqlen)
-            out.sum().backward()
-            clear_grads()
+            if name_w not in FORWARD_ONLY_IMPLS:
+                out.sum().backward()
+                clear_grads()
 
     profiled = []
     for label, fn in implementations:
-        out, q_grad = run_profile(label, fn, cu, max_seqlen, name)
+        out, q_grad = run_profile(
+            label, fn, cu, max_seqlen, name, supports_backward=label not in FORWARD_ONLY_IMPLS
+        )
         profiled.append((label, out, q_grad))
 
     reference_label, reference_out, reference_q_grad = profiled[0]
     print(f"[{name}] q_grad nan:")
     for label, _, q_grad in profiled:
-        print(f"  {label}: {q_grad.isnan().any().item()}")
+        if q_grad is None:
+            print(f"  {label}: N/A (forward-only)")
+        else:
+            print(f"  {label}: {q_grad.isnan().any().item()}")
 
     for label, out, q_grad in profiled[1:]:
         output_diff = (out.detach() - reference_out.detach()).abs()
-        grad_diff = (q_grad.detach() - reference_q_grad.detach()).abs()
         print(f"[{name}] diff output {label}-{reference_label}, mean/max:", output_diff.mean().item(), output_diff.max().item())
-        print(f"[{name}] diff grad   {label}-{reference_label}, mean/max:", grad_diff.mean().item(), grad_diff.max().item())
+        if q_grad is not None and reference_q_grad is not None:
+            grad_diff = (q_grad.detach() - reference_q_grad.detach()).abs()
+            print(f"[{name}] diff grad   {label}-{reference_label}, mean/max:", grad_diff.mean().item(), grad_diff.max().item())
