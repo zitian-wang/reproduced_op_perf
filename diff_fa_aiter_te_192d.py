@@ -73,7 +73,7 @@ def get_dot_product_attention():
 
 def run_te_rocm(cu, max_seqlen):
     attention = get_fused_attention()
-    return attention(
+    out = attention(
         q, k, v,
         qkv_layout="thd_thd_thd",
         cu_seqlens_q=cu,
@@ -99,6 +99,9 @@ def run_te_rocm(cu, max_seqlen):
         pad_between_seqs=False,
         inference_params=None,
     )
+    if out.ndim == 2:
+        out = out.view_as(q)
+    return out
 
 
 def run_te_cuda(cu, max_seqlen):
