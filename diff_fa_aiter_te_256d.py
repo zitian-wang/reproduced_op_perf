@@ -212,16 +212,38 @@ def make_implementations():
     return implementations
 
 
+PROFILE_WARMUP_ITERS = 3
+PROFILE_ACTIVE_ITERS = 10
+
+
 def run_profile(label, fn, cu, max_seqlen, config_name):
     clear_grads()
     torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True) as prof:
+    out = None
+    q_grad = None
+
+    for _ in range(PROFILE_WARMUP_ITERS):
         out = fn(cu, max_seqlen)
         out.sum().backward()
         q_grad = q.grad.clone()
-    clear_grads()
+        clear_grads()
+    torch.cuda.synchronize()
+
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True) as prof:
+        start_evt.record()
+        for _ in range(PROFILE_ACTIVE_ITERS):
+            out = fn(cu, max_seqlen)
+            out.sum().backward()
+            q_grad = q.grad.clone()
+            clear_grads()
+        end_evt.record()
+    torch.cuda.synchronize()
+    avg_ms = start_evt.elapsed_time(end_evt) / PROFILE_ACTIVE_ITERS
     print(f"--- {label} ({config_name}) ---")
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    print(f"[{config_name}] {label} avg time/iter (fwd+bwd): {avg_ms:.3f} ms (over {PROFILE_ACTIVE_ITERS} iters)")
     return out, q_grad
 
 
