@@ -17,7 +17,7 @@ cu_k = torch.tensor([0,  3928,  6111,  9866, 11515, 14854, 17020, 19084, 22679, 
 
 
 causal = True
-softmax_scale = 0.08838834764831845
+softmax_scale = 72 ** -0.5
 
 is_rocm = torch.version.hip is not None
 is_cuda = torch.version.cuda is not None and not is_rocm

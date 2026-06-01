@@ -12,7 +12,7 @@ dtype = torch.bfloat16
 total_seqlen = 1024 * 32  # 32768
 num_heads = 16
 head_dim = 192
-softmax_scale = 0.08838834764831843
+softmax_scale = head_dim ** -0.5
 causal = True
 
 is_rocm = torch.version.hip is not None
@@ -22,7 +22,6 @@ backend = "rocm" if is_rocm else "cuda" if is_cuda else "unknown"
 aiter_flash_attn_varlen_func = None
 fused_attention = None
 dot_product_attention = None
-attention_mask = None
 
 
 def get_aiter_flash_attn_varlen_func():
@@ -72,15 +71,6 @@ def get_dot_product_attention():
     return dot_product_attention
 
 
-def get_attention_mask():
-    global attention_mask
-    if attention_mask is None:
-        attention_mask = torch.triu(
-            torch.ones(total_seqlen, total_seqlen, device=device), diagonal=1
-        ).bool().unsqueeze(0).unsqueeze(0)
-    return attention_mask
-
-
 def run_te_rocm(cu, max_seqlen):
     attention = get_fused_attention()
     return attention(
@@ -93,7 +83,7 @@ def run_te_rocm(cu, max_seqlen):
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         attn_mask_type="padding_causal",
-        attention_mask=get_attention_mask(),
+        attention_mask=None,
         window_size=(-1, 0),
         fused_attention_backend=1,  # tex.NVTE_Fused_Attn_Backend.NVTE_CK
         core_attention_bias_type="no_bias",
