@@ -168,9 +168,19 @@ cu_varlen_list = [0, 3602, 5672, 9207, 11229, 14814, 15286, 18924, 19417, 20504,
 cu_varlen = torch.tensor(cu_varlen_list, dtype=torch.int32, device=device)
 max_seqlen_varlen = max(b - a for a, b in zip(cu_varlen_list[:-1], cu_varlen_list[1:]))  # 3638
 
+# FlyDSL best case: equal-length sequences whose length is a multiple of 128
+# (the kernel's BLOCK_M, so no padding waste). Total valid tokens match the
+# single_long_seq case (16 * 2048 == 32768 == total_seqlen).
+uniform_seqlen = 2048
+assert total_seqlen % uniform_seqlen == 0 and uniform_seqlen % 128 == 0
+cu_uniform_list = list(range(0, total_seqlen + 1, uniform_seqlen))
+cu_uniform = torch.tensor(cu_uniform_list, dtype=torch.int32, device=device)
+max_seqlen_uniform = uniform_seqlen
+
 configs = [
     ("single_long_seq", cu_single, max_seqlen_single),
     ("varlen_batch", cu_varlen, max_seqlen_varlen),
+    ("uniform_len", cu_uniform, max_seqlen_uniform),
 ]
 
 
