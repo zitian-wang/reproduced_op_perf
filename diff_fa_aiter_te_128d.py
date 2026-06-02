@@ -27,7 +27,10 @@ if FLYDSL_ROOT not in sys.path:
 FLYDSL_HEAD_DIM = head_dim
 
 # Implementations that only support a forward pass (no backward / q.grad).
-FORWARD_ONLY_IMPLS = {"flydsl"}
+FORWARD_ONLY_IMPLS = {"flydsl_loop", "flydsl_batched"}
+
+# Base names whose loop/batched variants should be compared per config.
+VARIANT_BASES = ("flydsl", "pytorch")
 
 aiter_flash_attn_varlen_func = None
 fused_attention = None
@@ -197,7 +200,10 @@ def run_aiter(cu, max_seqlen):
     return out
 
 
-def run_flydsl(cu, max_seqlen):
+def run_flydsl_loop(cu, max_seqlen):
+    # Per-sequence: one kernel launch per sequence, each padded to a multiple
+    # of 128 (the kernel's BLOCK_M). Avoids wasted compute on padding but pays
+    # per-sequence launch overhead.
     exe = get_flydsl_attn()
     cu_list = cu.tolist()
     outs = []
@@ -222,7 +228,38 @@ def run_flydsl(cu, max_seqlen):
     return torch.cat(outs, dim=0)
 
 
-def run_pytorch(cu, max_seqlen):
+def run_flydsl_batched(cu, max_seqlen):
+    # Pad every sequence to a common length (multiple of 128, the kernel's
+    # BLOCK_M) and run the whole varlen batch as a single kernel launch.
+    # Causal masking keeps real queries (pos < s) from attending trailing
+    # padding (pos > i), so padded outputs are discarded without affecting
+    # the real tokens. Saves launch overhead but wastes O(S^2) compute on
+    # padding when sequence lengths are uneven.
+    exe = get_flydsl_attn()
+    cu_list = cu.tolist()
+    num_seqs = len(cu_list) - 1
+    s_pad = ((max_seqlen + 127) // 128) * 128
+    q_b = q.new_zeros((num_seqs, s_pad, num_heads, FLYDSL_HEAD_DIM))
+    k_b = k.new_zeros((num_seqs, s_pad, num_heads, FLYDSL_HEAD_DIM))
+    v_b = v.new_zeros((num_seqs, s_pad, num_heads, FLYDSL_HEAD_DIM))
+    for i in range(num_seqs):
+        a, b = cu_list[i], cu_list[i + 1]
+        q_b[i, : b - a, :, :head_dim] = q[a:b].detach()
+        k_b[i, : b - a, :, :head_dim] = k[a:b].detach()
+        v_b[i, : b - a, :, :head_dim] = v[a:b].detach()
+    q_flat = q_b.contiguous().view(-1)
+    k_flat = k_b.contiguous().view(-1)
+    v_flat = v_b.contiguous().view(-1)
+    o_flat = torch.zeros_like(q_flat)
+    exe(q_flat, k_flat, v_flat, o_flat, num_seqs, s_pad)
+    o_b = o_flat.view(num_seqs, s_pad, num_heads, FLYDSL_HEAD_DIM)
+    outs = [o_b[i, : cu_list[i + 1] - cu_list[i], :, :head_dim] for i in range(num_seqs)]
+    return torch.cat(outs, dim=0)
+
+
+def run_pytorch_loop(cu, max_seqlen):
+    # Per-sequence SDPA loop: no wasted padding compute, but one kernel launch
+    # (plus a host sync) per sequence.
     outputs = []
     for i in range(cu.numel() - 1):
         start, end = cu[i].item(), cu[i + 1].item()
@@ -241,6 +278,34 @@ def run_pytorch(cu, max_seqlen):
     return torch.cat(outputs, dim=0)
 
 
+def run_pytorch_batched(cu, max_seqlen):
+    # Pack the packed-varlen tensors into a padded [B, S, H, D] batch and run
+    # a single batched SDPA call. is_causal masking makes trailing zero pads
+    # invisible to real queries, so the result matches per-sequence attention.
+    # Saves launch overhead but wastes O(S^2) compute on padding.
+    cu_list = cu.tolist()
+    num_seqs = len(cu_list) - 1
+    s_pad = max_seqlen
+    q_b = q.new_zeros((num_seqs, s_pad, num_heads, head_dim))
+    k_b = k.new_zeros((num_seqs, s_pad, num_heads, head_dim))
+    v_b = v.new_zeros((num_seqs, s_pad, num_heads, head_dim))
+    for i in range(num_seqs):
+        a, b = cu_list[i], cu_list[i + 1]
+        q_b[i, : b - a] = q[a:b]
+        k_b[i, : b - a] = k[a:b]
+        v_b[i, : b - a] = v[a:b]
+    out_b = F.scaled_dot_product_attention(
+        q_b.transpose(1, 2),
+        k_b.transpose(1, 2),
+        v_b.transpose(1, 2),
+        dropout_p=0.0,
+        is_causal=causal,
+        scale=softmax_scale,
+    ).transpose(1, 2)
+    outputs = [out_b[i, : cu_list[i + 1] - cu_list[i]] for i in range(num_seqs)]
+    return torch.cat(outputs, dim=0)
+
+
 def make_implementations():
     implementations = [("flash_attn", run_flash_attn)]
     if is_rocm:
@@ -248,15 +313,18 @@ def make_implementations():
             [
                 ("aiter", run_aiter),
                 ("transformer_engine", run_te),
-                ("flydsl", run_flydsl),
-                ("pytorch", run_pytorch),
+                ("flydsl_loop", run_flydsl_loop),
+                ("flydsl_batched", run_flydsl_batched),
+                ("pytorch_loop", run_pytorch_loop),
+                ("pytorch_batched", run_pytorch_batched),
             ]
         )
     elif is_cuda:
         implementations.extend(
             [
                 ("transformer_engine", run_te),
-                ("pytorch", run_pytorch),
+                ("pytorch_loop", run_pytorch_loop),
+                ("pytorch_batched", run_pytorch_batched),
             ]
         )
     else:
@@ -304,13 +372,14 @@ def run_profile(label, fn, cu, max_seqlen, config_name, supports_backward=True):
                 clear_grads()
     torch.cuda.synchronize()
     fwd_ms = sum(s.elapsed_time(e) for s, e in fwd_pairs) / len(fwd_pairs)
+    bwd_ms = None
     print(f"--- {label} ({config_name}) ---")
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     print(f"[{config_name}] {label} fwd time/iter: {fwd_ms:.3f} ms (over {PROFILE_ACTIVE_ITERS} iters)")
     if bwd_pairs:
         bwd_ms = sum(s.elapsed_time(e) for s, e in bwd_pairs) / len(bwd_pairs)
         print(f"[{config_name}] {label} bwd time/iter: {bwd_ms:.3f} ms (over {PROFILE_ACTIVE_ITERS} iters)")
-    return out, q_grad
+    return out, q_grad, fwd_ms, bwd_ms
 
 
 implementations = make_implementations()
@@ -327,11 +396,25 @@ for name, cu, max_seqlen in configs:
                 clear_grads()
 
     profiled = []
+    timings = {}
     for label, fn in implementations:
-        out, q_grad = run_profile(
+        out, q_grad, fwd_ms, bwd_ms = run_profile(
             label, fn, cu, max_seqlen, name, supports_backward=label not in FORWARD_ONLY_IMPLS
         )
         profiled.append((label, out, q_grad))
+        timings[label] = (fwd_ms, bwd_ms)
+
+    print(f"[{name}] fastest variant per library (total = fwd + bwd):")
+    for base in VARIANT_BASES:
+        variants = [(lbl, t) for lbl, t in timings.items() if lbl.startswith(base + "_")]
+        if len(variants) < 2:
+            continue
+        def total_ms(t):
+            fwd, bwd = t
+            return fwd + (bwd or 0.0)
+        best_label, best_t = min(variants, key=lambda kv: total_ms(kv[1]))
+        detail = ", ".join(f"{lbl}={total_ms(t):.3f}ms" for lbl, t in variants)
+        print(f"  {base}: fastest={best_label} ({detail})")
 
     reference_label, reference_out, reference_q_grad = profiled[0]
     print(f"[{name}] q_grad nan:")
