@@ -28,7 +28,7 @@ if FLYDSL_ROOT not in sys.path:
 FLYDSL_HEAD_DIM = 256 if head_dim == 192 else head_dim
 
 # Implementations that only support a forward pass (no backward / q.grad).
-FORWARD_ONLY_IMPLS = {"flydsl_loop", "flydsl_batched"}
+FORWARD_ONLY_IMPLS = {"flydsl_loop", "flydsl_batched", "flydsl_varlen"}
 
 # Base names whose loop/batched variants should be compared per config.
 VARIANT_BASES = ("pytorch",)
@@ -37,6 +37,7 @@ aiter_flash_attn_varlen_func = None
 fused_attention = None
 dot_product_attention = None
 flydsl_attn = None
+flydsl_varlen_attn = None
 
 
 def get_flydsl_attn():
@@ -52,6 +53,21 @@ def get_flydsl_attn():
             sm_scale=softmax_scale,
         )
     return flydsl_attn
+
+
+def get_flydsl_varlen_attn():
+    global flydsl_varlen_attn
+    if flydsl_varlen_attn is None:
+        from kernels.flash_attn_varlen_func import build_flash_attn_varlen_func_module
+
+        flydsl_varlen_attn = build_flash_attn_varlen_func_module(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            causal=causal,
+            dtype_str="bf16",
+            sm_scale=softmax_scale,
+        )
+    return flydsl_varlen_attn
 
 
 def get_aiter_flash_attn_varlen_func():
@@ -201,6 +217,20 @@ def run_aiter(cu, max_seqlen):
     return out
 
 
+def run_flydsl_varlen(cu, max_seqlen):
+    # New native varlen kernel: a SINGLE launch over the packed THD buffer with
+    # no per-sequence padding. Supports head_dim=256 natively (VT_PAD dropped to
+    # keep the K+V LDS tiles inside gfx942's 64KB budget).
+    exe = get_flydsl_varlen_attn()
+    num_seqs = cu.numel() - 1
+    q_flat = q.detach().contiguous().view(-1)
+    k_flat = k.detach().contiguous().view(-1)
+    v_flat = v.detach().contiguous().view(-1)
+    o_flat = torch.zeros_like(q_flat)
+    exe(q_flat, k_flat, v_flat, o_flat, cu.to(torch.int32), num_seqs, int(max_seqlen))
+    return o_flat.view(total_seqlen, num_heads, head_dim)
+
+
 def run_flydsl(cu, max_seqlen):
     exe = get_flydsl_attn()
     cu_list = cu.tolist()
@@ -282,8 +312,10 @@ def make_implementations():
             [
                 ("aiter", run_aiter),
                 ("transformer_engine", run_te),
-                # flydsl skipped: head_dim=256 LDS footprint overflows gfx942's
-                # 64KB limit. See diff_fa_aiter_te_128d.py.
+                # flash_attn_func (old kernel) is skipped at head_dim=256: its LDS
+                # footprint overflows gfx942's 64KB. The new varlen kernel runs
+                # head_dim=256 natively.
+                ("flydsl_varlen", run_flydsl_varlen),
                 ("pytorch_loop", run_pytorch_loop),
                 ("pytorch_batched", run_pytorch_batched),
             ]
